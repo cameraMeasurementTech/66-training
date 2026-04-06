@@ -10,8 +10,11 @@
 #   export SWE_MODEL_PATH=Qwen/Qwen2.5-32B-Instruct
 #
 # --- Data (pick one) ---
-# Local parquet:
-#   export SWE_TRAIN_PARQUET=... SWE_VAL_PARQUET=...
+# Local directory: all *.parquet in the folder (sorted; see SWE_PARQUET_RECURSIVE):
+#   export SWE_TRAIN_PARQUET_DIR=/data/swe_shards
+#   export SWE_VAL_PARQUET=/data/val.parquet   # or SWE_VAL_PARQUET_DIR=... or SWE_REUSE_TRAIN_FOR_VAL=1
+# Local explicit list (comma-separated paths — no spaces after commas):
+#   export SWE_TRAIN_PARQUETS="/data/a.parquet,/data/b.parquet"
 # Hub dataset repo (parquet files in the repo; uses huggingface_hub to download/cache):
 #   export SWE_HF_DATASET_REPO=org/my-dataset
 #   export SWE_HF_TRAIN_GLOBS='data/train-*.parquet'   # comma-separated for multiple globs
@@ -34,10 +37,19 @@ cd "${REPO_ROOT}"
 SWE_MODEL_PATH="${SWE_MODEL_PATH:-/path/to/your/Qwen-32B-Instruct}"
 
 # ---- Local data (used when SWE_HF_DATASET_REPO is empty) ----
-SWE_TRAIN_PARQUET="${SWE_TRAIN_PARQUET:-/path/to/swe_train.parquet}"
-SWE_VAL_PARQUET="${SWE_VAL_PARQUET:-/path/to/swe_val.parquet}"
+# Train: SWE_TRAIN_PARQUET_DIR (all *.parquet in dir) OR SWE_TRAIN_PARQUETS OR SWE_TRAIN_PARQUET (mutually exclusive base).
+SWE_TRAIN_PARQUET_DIR="${SWE_TRAIN_PARQUET_DIR:-}"
+SWE_TRAIN_PARQUET="${SWE_TRAIN_PARQUET:-}"
+SWE_TRAIN_PARQUETS="${SWE_TRAIN_PARQUETS:-}"
+SWE_VAL_PARQUET_DIR="${SWE_VAL_PARQUET_DIR:-}"
+SWE_VAL_PARQUET="${SWE_VAL_PARQUET:-}"
+SWE_VAL_PARQUETS="${SWE_VAL_PARQUETS:-}"
+# If 1: use find; else only *.parquet directly under the train/val dir (maxdepth 1).
+SWE_PARQUET_RECURSIVE="${SWE_PARQUET_RECURSIVE:-0}"
+# If 1: use the same file list for val as for train (val loss is not held-out; see README).
+SWE_REUSE_TRAIN_FOR_VAL="${SWE_REUSE_TRAIN_FOR_VAL:-0}"
 
-# Optional: second local parquet merged into training (ignored if SWE_HF_DATASET_REPO is set).
+# Optional: extra local parquet merged onto the training list (ignored if SWE_HF_DATASET_REPO is set).
 SWE_MIX_PARQUET="${SWE_MIX_PARQUET:-}"
 
 # ---- Hugging Face dataset (parquet files in repo) ----
@@ -68,6 +80,80 @@ USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
 LORA_RANK="${LORA_RANK:-0}"
 
 HYDRA_EXTRA="${HYDRA_EXTRA:-}"
+
+# prefix: data.train_files or data.val_files; csv: comma-separated paths (no commas inside paths)
+csv_to_hydra_files() {
+  local prefix="$1"
+  local csv="$2"
+  local -a paths=()
+  local p
+  IFS=',' read -r -a _raw <<< "${csv}"
+  for p in "${_raw[@]}"; do
+    [[ -z "${p}" ]] && continue
+    paths+=("${p}")
+  done
+  local n=${#paths[@]}
+  if [[ "${n}" -eq 0 ]]; then
+    echo ""
+    return 1
+  elif [[ "${n}" -eq 1 ]]; then
+    echo "${prefix}=${paths[0]}"
+  else
+    local out="${prefix}=[${paths[0]}"
+    local i=1
+    while [[ "${i}" -lt "${n}" ]]; do
+      out+=",${paths[i]}"
+      i=$((i + 1))
+    done
+    out+="]"
+    echo "${out}"
+  fi
+}
+
+verify_parquet_csv() {
+  local csv="$1"
+  local label="$2"
+  local p
+  IFS=',' read -r -a _raw <<< "${csv}"
+  for p in "${_raw[@]}"; do
+    [[ -z "${p}" ]] && continue
+    if [[ ! -f "${p}" ]]; then
+      echo "ERROR: ${label} parquet not found: ${p}" >&2
+      exit 1
+    fi
+  done
+}
+
+# Print comma-separated absolute paths of *.parquet under dir (sorted). $2 = recursive (1/true = subfolders).
+discover_parquet_dir_csv() {
+  local dir="$1"
+  local recursive="${2:-0}"
+  if [[ ! -d "${dir}" ]]; then
+    echo "ERROR: Parquet directory does not exist or is not a directory: ${dir}" >&2
+    exit 1
+  fi
+  local -a files=()
+  local f
+  if [[ "${recursive}" == "1" || "${recursive}" == "true" ]]; then
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] && files+=("${f}")
+    done < <(find "${dir}" -type f \( -name '*.parquet' -o -name '*.PARQUET' \) | LC_ALL=C sort)
+  else
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] && files+=("${f}")
+    done < <(find "${dir}" -maxdepth 1 -type f \( -name '*.parquet' -o -name '*.PARQUET' \) | LC_ALL=C sort)
+  fi
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "ERROR: No .parquet files under ${dir} (recursive=${recursive})" >&2
+    exit 1
+  fi
+  local i out=""
+  for ((i = 0; i < ${#files[@]}; i++)); do
+    [[ ${i} -gt 0 ]] && out+=","
+    out+="${files[i]}"
+  done
+  echo "${out}"
+}
 
 # --- Validate model path: local checkpoint dir OR Hub id ---
 if [[ -d "${SWE_MODEL_PATH}" ]]; then
@@ -126,25 +212,64 @@ if [[ -n "${SWE_HF_DATASET_REPO}" ]]; then
     VAL_FILES_ARG="data.val_files=${SWE_VAL_PARQUET}"
   fi
 else
-  if [[ ! -f "${SWE_TRAIN_PARQUET}" ]]; then
-    echo "ERROR: SWE_TRAIN_PARQUET not found: ${SWE_TRAIN_PARQUET} (or set SWE_HF_DATASET_REPO + SWE_HF_TRAIN_GLOBS)" >&2
-    exit 1
-  fi
-  if [[ ! -f "${SWE_VAL_PARQUET}" ]]; then
-    echo "ERROR: SWE_VAL_PARQUET not found: ${SWE_VAL_PARQUET}" >&2
+  _train_sources=0
+  [[ -n "${SWE_TRAIN_PARQUET_DIR}" ]] && _train_sources=$((_train_sources + 1))
+  [[ -n "${SWE_TRAIN_PARQUETS}" ]] && _train_sources=$((_train_sources + 1))
+  [[ -n "${SWE_TRAIN_PARQUET}" ]] && _train_sources=$((_train_sources + 1))
+  if [[ "${_train_sources}" -gt 1 ]]; then
+    echo "ERROR: Use only one of SWE_TRAIN_PARQUET_DIR, SWE_TRAIN_PARQUETS, or SWE_TRAIN_PARQUET (then optional SWE_MIX_PARQUET)." >&2
     exit 1
   fi
 
+  TRAIN_CSV=""
+  if [[ -n "${SWE_TRAIN_PARQUET_DIR}" ]]; then
+    TRAIN_CSV="$(discover_parquet_dir_csv "${SWE_TRAIN_PARQUET_DIR}" "${SWE_PARQUET_RECURSIVE}")"
+  elif [[ -n "${SWE_TRAIN_PARQUETS}" ]]; then
+    TRAIN_CSV="${SWE_TRAIN_PARQUETS}"
+  elif [[ -n "${SWE_TRAIN_PARQUET}" ]]; then
+    TRAIN_CSV="${SWE_TRAIN_PARQUET}"
+  else
+    echo "ERROR: Set SWE_TRAIN_PARQUET_DIR, SWE_TRAIN_PARQUETS, or SWE_TRAIN_PARQUET, or use SWE_HF_DATASET_REPO." >&2
+    exit 1
+  fi
   if [[ -n "${SWE_MIX_PARQUET}" ]]; then
     if [[ ! -f "${SWE_MIX_PARQUET}" ]]; then
       echo "ERROR: SWE_MIX_PARQUET set but file missing: ${SWE_MIX_PARQUET}" >&2
       exit 1
     fi
-    TRAIN_FILES_ARG="data.train_files=[${SWE_TRAIN_PARQUET},${SWE_MIX_PARQUET}]"
-  else
-    TRAIN_FILES_ARG="data.train_files=${SWE_TRAIN_PARQUET}"
+    TRAIN_CSV="${TRAIN_CSV},${SWE_MIX_PARQUET}"
   fi
-  VAL_FILES_ARG="data.val_files=${SWE_VAL_PARQUET}"
+
+  verify_parquet_csv "${TRAIN_CSV}" "Train"
+  TRAIN_FILES_ARG="$(csv_to_hydra_files "data.train_files" "${TRAIN_CSV}")"
+
+  _val_sources=0
+  [[ "${SWE_REUSE_TRAIN_FOR_VAL}" == "1" || "${SWE_REUSE_TRAIN_FOR_VAL}" == "true" ]] && _val_sources=$((_val_sources + 1))
+  [[ -n "${SWE_VAL_PARQUET_DIR}" ]] && _val_sources=$((_val_sources + 1))
+  [[ -n "${SWE_VAL_PARQUETS}" ]] && _val_sources=$((_val_sources + 1))
+  [[ -n "${SWE_VAL_PARQUET}" ]] && _val_sources=$((_val_sources + 1))
+  if [[ "${_val_sources}" -gt 1 ]]; then
+    echo "ERROR: Use only one of SWE_REUSE_TRAIN_FOR_VAL, SWE_VAL_PARQUET_DIR, SWE_VAL_PARQUETS, or SWE_VAL_PARQUET." >&2
+    exit 1
+  fi
+
+  VAL_CSV=""
+  if [[ "${SWE_REUSE_TRAIN_FOR_VAL}" == "1" || "${SWE_REUSE_TRAIN_FOR_VAL}" == "true" ]]; then
+    VAL_CSV="${TRAIN_CSV}"
+    echo "WARN: SWE_REUSE_TRAIN_FOR_VAL: validation uses the same parquet file(s) as training; val loss is not a clean held-out metric." >&2
+  elif [[ -n "${SWE_VAL_PARQUET_DIR}" ]]; then
+    VAL_CSV="$(discover_parquet_dir_csv "${SWE_VAL_PARQUET_DIR}" "${SWE_PARQUET_RECURSIVE}")"
+  elif [[ -n "${SWE_VAL_PARQUETS}" ]]; then
+    VAL_CSV="${SWE_VAL_PARQUETS}"
+  elif [[ -n "${SWE_VAL_PARQUET}" ]]; then
+    VAL_CSV="${SWE_VAL_PARQUET}"
+  else
+    echo "ERROR: No validation data. Set SWE_VAL_PARQUET_DIR, SWE_VAL_PARQUET, SWE_VAL_PARQUETS, or SWE_REUSE_TRAIN_FOR_VAL=1 (see recipe/swe/README.md)." >&2
+    exit 1
+  fi
+
+  verify_parquet_csv "${VAL_CSV}" "Validation"
+  VAL_FILES_ARG="$(csv_to_hydra_files "data.val_files" "${VAL_CSV}")"
 fi
 
 mkdir -p "${SAVE_DIR}"
