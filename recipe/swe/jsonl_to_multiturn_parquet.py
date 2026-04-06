@@ -2,7 +2,11 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Convert JSONL (one object per line) with a `messages` field into Parquet for MultiTurnSFTDataset."""
+"""Convert JSONL (one object per line) with a `messages` field into Parquet for MultiTurnSFTDataset.
+
+If your data is already Parquet on the Hugging Face Hub, use `hf_fetch_parquet_for_sft.py` plus
+`run_swe_multiturn_sft.sh` (set SWE_HF_DATASET_REPO and SWE_HF_TRAIN_GLOBS) instead of this script.
+"""
 
 import argparse
 import json

@@ -3,12 +3,26 @@
 # Uses the same tokenizer and vocabulary as the base checkpoint (model.partial_pretrain).
 # Full model fine-tune: keep LORA_RANK=0 (trains all parameters; model size unchanged).
 #
-# Mitigate forgetting other capabilities by:
-#   - mixing general instruct data (see SWE_MIX_PARQUET and HYDRA_EXTRA),
-#   - using a moderate learning rate and early stopping via val loss / small epoch count.
+# --- Model (pick one) ---
+# Local directory with config.json:
+#   export SWE_MODEL_PATH=/path/to/Qwen-32B-Instruct
+# Hugging Face Hub model id (verl uses from_pretrained; weights stream from cache):
+#   export SWE_MODEL_PATH=Qwen/Qwen2.5-32B-Instruct
 #
-# After SFT, you can run RL with GPPO using the same codebase (recipe/dapo/*.sh), pointing
-# actor_rollout_ref.model.path at the saved SFT checkpoint.
+# --- Data (pick one) ---
+# Local parquet:
+#   export SWE_TRAIN_PARQUET=... SWE_VAL_PARQUET=...
+# Hub dataset repo (parquet files in the repo; uses huggingface_hub to download/cache):
+#   export SWE_HF_DATASET_REPO=org/my-dataset
+#   export SWE_HF_TRAIN_GLOBS='data/train-*.parquet'   # comma-separated for multiple globs
+#   export SWE_HF_VAL_GLOBS='data/validation-*.parquet'  # optional if SWE_VAL_PARQUET is set instead
+#
+# Gated assets: export HF_TOKEN=... (or huggingface-cli login).
+#
+# Mitigate forgetting: mix data (local SWE_MIX_PARQUET), moderate LR, few epochs — not combinable with
+# SWE_HF_DATASET_REPO in this script; use HYDRA_EXTRA to pass extra train_files if needed.
+#
+# After SFT, RL + GPPO: recipe/dapo/*.sh with actor_rollout_ref.model.path pointing at the SFT checkpoint.
 #
 set -euo pipefail
 
@@ -16,26 +30,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-# ---- Required local paths (export or edit here) ----
+# ---- Model (local dir with config.json, or Hub id e.g. Qwen/Qwen2.5-32B-Instruct) ----
 SWE_MODEL_PATH="${SWE_MODEL_PATH:-/path/to/your/Qwen-32B-Instruct}"
+
+# ---- Local data (used when SWE_HF_DATASET_REPO is empty) ----
 SWE_TRAIN_PARQUET="${SWE_TRAIN_PARQUET:-/path/to/swe_train.parquet}"
 SWE_VAL_PARQUET="${SWE_VAL_PARQUET:-/path/to/swe_val.parquet}"
 
-# Optional: second parquet merged into training (e.g. general chat / instruction following).
-# Leave empty to train only on SWE_TRAIN_PARQUET.
+# Optional: second local parquet merged into training (ignored if SWE_HF_DATASET_REPO is set).
 SWE_MIX_PARQUET="${SWE_MIX_PARQUET:-}"
+
+# ---- Hugging Face dataset (parquet files in repo) ----
+SWE_HF_DATASET_REPO="${SWE_HF_DATASET_REPO:-}"
+SWE_HF_REVISION="${SWE_HF_REVISION:-}"
+# Comma-separated globs vs paths in the repo, e.g. data/train-*.parquet,splits/train/*.parquet
+SWE_HF_TRAIN_GLOBS="${SWE_HF_TRAIN_GLOBS:-}"
+SWE_HF_VAL_GLOBS="${SWE_HF_VAL_GLOBS:-}"
 
 # ---- Cluster ----
 NUM_GPUS="${NUM_GPUS:-8}"
-# Sequence parallel (Ulysses). Use >1 for very long max_length on large models.
 SP_SIZE="${SP_SIZE:-1}"
 
-# ---- Data format ----
-# Parquet column must be a list of {"role": "...", "content": "..."} (Qwen/chat templates).
 MESSAGES_KEY="${MESSAGES_KEY:-messages}"
 
-# ---- Training hyperparameters (tune for 32B + your GPU memory) ----
-# Global batch before internal DP split; safe default ~1 sample per GPU when SP_SIZE=1.
 GLOBAL_TRAIN_BATCH_SIZE="${GLOBAL_TRAIN_BATCH_SIZE:-${NUM_GPUS}}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 MAX_LENGTH="${MAX_LENGTH:-32768}"
@@ -45,45 +62,93 @@ TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 SAVE_DIR="${SAVE_DIR:-${HOME}/ckpts/swe-qwen32b-multiturn-sft}"
 
-# Qwen often needs trust_remote_code
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-True}"
-# Strongly recommended for 32B full FT
 ENABLE_GRAD_CKPT="${ENABLE_GRAD_CKPT:-True}"
 USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
 LORA_RANK="${LORA_RANK:-0}"
 
-# Extra Hydra overrides (space-separated), e.g.:
-#   HYDRA_EXTRA="trainer.logger=['console','wandb'] optim.weight_decay=0"
 HYDRA_EXTRA="${HYDRA_EXTRA:-}"
 
+# --- Validate model path: local checkpoint dir OR Hub id ---
+if [[ -d "${SWE_MODEL_PATH}" ]]; then
+  if [[ ! -f "${SWE_MODEL_PATH}/config.json" ]]; then
+    echo "ERROR: SWE_MODEL_PATH is a directory but missing config.json: ${SWE_MODEL_PATH}" >&2
+    exit 1
+  fi
+fi
 
-if [[ ! -f "${SWE_MODEL_PATH}/config.json" ]]; then
-  echo "ERROR: SWE_MODEL_PATH must be a Hugging Face model directory containing config.json: ${SWE_MODEL_PATH}" >&2
-  exit 1
-fi
-if [[ ! -f "${SWE_TRAIN_PARQUET}" ]]; then
-  echo "ERROR: SWE_TRAIN_PARQUET not found: ${SWE_TRAIN_PARQUET}" >&2
-  exit 1
-fi
-if [[ ! -f "${SWE_VAL_PARQUET}" ]]; then
-  echo "ERROR: SWE_VAL_PARQUET not found: ${SWE_VAL_PARQUET}" >&2
-  exit 1
+# --- Resolve data paths ---
+if [[ -n "${SWE_HF_DATASET_REPO}" ]]; then
+  if [[ -n "${SWE_MIX_PARQUET}" ]]; then
+    echo "ERROR: Do not set SWE_MIX_PARQUET together with SWE_HF_DATASET_REPO (extend globs or use HYDRA_EXTRA)." >&2
+    exit 1
+  fi
+  if [[ -z "${SWE_HF_TRAIN_GLOBS}" ]]; then
+    echo "ERROR: SWE_HF_DATASET_REPO is set but SWE_HF_TRAIN_GLOBS is empty (comma-separated fnmatch globs)." >&2
+    exit 1
+  fi
+
+  HF_FETCH_ARGS=(
+    "${REPO_ROOT}/recipe/swe/hf_fetch_parquet_for_sft.py"
+    --repo-id "${SWE_HF_DATASET_REPO}"
+    --emit hydra
+  )
+  if [[ -n "${SWE_HF_REVISION}" ]]; then
+    HF_FETCH_ARGS+=(--revision "${SWE_HF_REVISION}")
+  fi
+  IFS=',' read -r -a _train_globs <<< "${SWE_HF_TRAIN_GLOBS}"
+  for _g in "${_train_globs[@]}"; do
+    [[ -z "${_g}" ]] && continue
+    HF_FETCH_ARGS+=(--train-glob "${_g}")
+  done
+  if [[ -n "${SWE_HF_VAL_GLOBS}" ]]; then
+    IFS=',' read -r -a _val_globs <<< "${SWE_HF_VAL_GLOBS}"
+    for _g in "${_val_globs[@]}"; do
+      [[ -z "${_g}" ]] && continue
+      HF_FETCH_ARGS+=(--val-glob "${_g}")
+    done
+  fi
+
+  # shellcheck disable=SC2312
+  _py=python3
+  command -v python3 >/dev/null 2>&1 || _py=python
+  eval "$("${_py}" "${HF_FETCH_ARGS[@]}")"
+
+  if [[ -z "${TRAIN_FILES_ARG:-}" ]]; then
+    echo "ERROR: hf_fetch_parquet_for_sft.py did not set TRAIN_FILES_ARG" >&2
+    exit 1
+  fi
+  if [[ -z "${VAL_FILES_ARG:-}" ]]; then
+    if [[ ! -f "${SWE_VAL_PARQUET}" ]]; then
+      echo "ERROR: Hub run did not match val parquet; set SWE_HF_VAL_GLOBS or a local SWE_VAL_PARQUET file." >&2
+      exit 1
+    fi
+    VAL_FILES_ARG="data.val_files=${SWE_VAL_PARQUET}"
+  fi
+else
+  if [[ ! -f "${SWE_TRAIN_PARQUET}" ]]; then
+    echo "ERROR: SWE_TRAIN_PARQUET not found: ${SWE_TRAIN_PARQUET} (or set SWE_HF_DATASET_REPO + SWE_HF_TRAIN_GLOBS)" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SWE_VAL_PARQUET}" ]]; then
+    echo "ERROR: SWE_VAL_PARQUET not found: ${SWE_VAL_PARQUET}" >&2
+    exit 1
+  fi
+
+  if [[ -n "${SWE_MIX_PARQUET}" ]]; then
+    if [[ ! -f "${SWE_MIX_PARQUET}" ]]; then
+      echo "ERROR: SWE_MIX_PARQUET set but file missing: ${SWE_MIX_PARQUET}" >&2
+      exit 1
+    fi
+    TRAIN_FILES_ARG="data.train_files=[${SWE_TRAIN_PARQUET},${SWE_MIX_PARQUET}]"
+  else
+    TRAIN_FILES_ARG="data.train_files=${SWE_TRAIN_PARQUET}"
+  fi
+  VAL_FILES_ARG="data.val_files=${SWE_VAL_PARQUET}"
 fi
 
 mkdir -p "${SAVE_DIR}"
 
-if [[ -n "${SWE_MIX_PARQUET}" ]]; then
-  if [[ ! -f "${SWE_MIX_PARQUET}" ]]; then
-    echo "ERROR: SWE_MIX_PARQUET set but file missing: ${SWE_MIX_PARQUET}" >&2
-    exit 1
-  fi
-  # Hydra list; no spaces after commas. Paths must not contain commas.
-  TRAIN_FILES_ARG="data.train_files=[${SWE_TRAIN_PARQUET},${SWE_MIX_PARQUET}]"
-else
-  TRAIN_FILES_ARG="data.train_files=${SWE_TRAIN_PARQUET}"
-fi
-
-# GLOBAL_TRAIN_BATCH_SIZE must be divisible by (NUM_GPUS / SP_SIZE). See verl FSDPSFTTrainer._normalize_config_bsz.
 DP_GROUPS=$(( NUM_GPUS / SP_SIZE ))
 if (( GLOBAL_TRAIN_BATCH_SIZE % DP_GROUPS != 0 )); then
   echo "Adjusting GLOBAL_TRAIN_BATCH_SIZE (${GLOBAL_TRAIN_BATCH_SIZE}) to be divisible by DP groups (${DP_GROUPS})"
@@ -96,7 +161,7 @@ fi
 torchrun --standalone --nnodes=1 --nproc_per_node="${NUM_GPUS}" \
   -m verl.trainer.fsdp_sft_trainer \
   "${TRAIN_FILES_ARG}" \
-  data.val_files="${SWE_VAL_PARQUET}" \
+  "${VAL_FILES_ARG}" \
   data.multiturn.enable=True \
   data.multiturn.messages_key="${MESSAGES_KEY}" \
   data.max_length="${MAX_LENGTH}" \
